@@ -27,7 +27,6 @@ blueprint:
         device:
           filter:
             - manufacturer: Sunricher
-              model: ZG2858A
 #      default: 
 #        device_id: 17cd50f04cd5e8c747b276faf4b59eac
     target_light:
