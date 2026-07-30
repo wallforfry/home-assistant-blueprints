@@ -1,0 +1,293 @@
+blueprint:
+  name: Sunricher ZG2858A remote (Zigbee2MQTT)
+  description: >
+    Control a light from a Sunricher ZG2858A remote exposed by Zigbee2MQTT.
+    Zigbee2MQTT port of the original ZHA blueprint.
+
+    The remote supports 3 groups: create one automation per group you want to use.
+
+    Supported actions:
+
+    * scenes 1 to 6 (calls a Home Assistant script or scene)
+
+    * stepped dimming (up / down)
+
+    * continuous dimming with stop (button held down)
+
+    * direct brightness setting (`brightness_move_to_level`)
+
+    * colour wheel (hue/saturation or xy, depending on firmware)
+
+    * colour temperature
+
+    * `on` and `off` (separate commands)
+
+    The trigger listens directly on the device's MQTT topic, so it works with or
+    without the `event` entities / the legacy `action` sensor.
+  domain: automation
+  input:
+    mqtt_topic:
+      name: Remote MQTT topic
+      description: >
+        Base topic published by Zigbee2MQTT, without a trailing slash.
+        By default this is `zigbee2mqtt/` followed by the device's friendly_name,
+        for example: zigbee2mqtt/living_room_remote
+      selector:
+        text:
+    target_light:
+      name: Light to control
+      description: The light to control with the remote
+      default: {}
+      selector:
+        target:
+          entity:
+            - domain: light
+    source_endpoint:
+      name: Group (1, 2 or 3)
+      description: >
+        The remote group this automation responds to. Zigbee2MQTT reports it via
+        the `_ep1` / `_ep2` / `_ep3` suffix on the action. If your firmware sends
+        no suffix, the automation will respond to every group regardless of the
+        value set here.
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 3
+          step: 1
+          mode: box
+    dim_step:
+      name: Dimming step
+      description: Brightness percentage added or removed on each step
+      default: 8
+      selector:
+        number:
+          min: 1
+          max: 50
+          step: 1
+          unit_of_measurement: "%"
+    ct_calibration:
+      name: Colour temperature calibration
+      description: >
+        Applies the range correction from the original blueprint
+        (mireds + (mireds - 314.5) / 5). Disable this if your whites look off.
+      default: true
+      selector:
+        boolean:
+    scene_recall_script_1:
+      name: Script or scene to call for scene recall 1
+      default: null
+      selector:
+        entity:
+          filter:
+            domain:
+              - script
+              - scene
+    scene_recall_script_2:
+      name: Script or scene to call for scene recall 2
+      default: null
+      selector:
+        entity:
+          filter:
+            domain:
+              - script
+              - scene
+    scene_recall_script_3:
+      name: Script or scene to call for scene recall 3
+      default: null
+      selector:
+        entity:
+          filter:
+            domain:
+              - script
+              - scene
+    scene_recall_script_4:
+      name: Script or scene to call for scene recall 4
+      default: null
+      selector:
+        entity:
+          filter:
+            domain:
+              - script
+              - scene
+    scene_recall_script_5:
+      name: Script or scene to call for scene recall 5
+      default: null
+      selector:
+        entity:
+          filter:
+            domain:
+              - script
+              - scene
+    scene_recall_script_6:
+      name: Script or scene to call for scene recall 6
+      default: null
+      selector:
+        entity:
+          filter:
+            domain:
+              - script
+              - scene
+
+# restart is essential: it is what lets the brightness_stop action
+# interrupt a running continuous-dimming loop.
+mode: restart
+max_exceeded: silent
+
+triggers:
+  - trigger: mqtt
+    topic: !input mqtt_topic
+
+variables:
+  ep: !input source_endpoint
+  step_pct: !input dim_step
+  ct_cal: !input ct_calibration
+  payload: "{{ trigger.payload_json | default({}, true) }}"
+  raw_action: "{{ payload.action | default('', true) | string }}"
+  # Action without the group suffix: on_ep2 -> on
+  act: "{{ raw_action | regex_replace('_ep[0-9]+$', '') }}"
+  # Group number extracted from the suffix, empty when absent
+  act_ep: "{{ ((raw_action | regex_findall('_ep([0-9]+)$')) + [''])[0] | string }}"
+  scene_no: >-
+    {%- if act.startswith('scene_') -%}
+      {{ act.split('_')[-1] | int(0) }}
+    {%- elif act in ['recall', 'store'] -%}
+      {{ payload.action_scene_id | default(0) | int(0) }}
+    {%- else -%}
+      0
+    {%- endif -%}
+  scene_scripts:
+    "1": !input scene_recall_script_1
+    "2": !input scene_recall_script_2
+    "3": !input scene_recall_script_3
+    "4": !input scene_recall_script_4
+    "5": !input scene_recall_script_5
+    "6": !input scene_recall_script_6
+  scene_target: "{{ scene_scripts.get(scene_no | int(0) | string) }}"
+
+conditions:
+  # Z2M republishes {"action":""} right after every action, and also sends
+  # battery / linkquality messages with no action at all: ignore those.
+  - condition: template
+    value_template: "{{ raw_action not in ['', 'None'] }}"
+  # Group filtering
+  - condition: template
+    value_template: "{{ act_ep in ['', ep | string] }}"
+
+actions:
+  - choose:
+      # ---------------------------------------------------------------- on/off
+      - conditions: "{{ act == 'on' }}"
+        sequence:
+          - action: light.turn_on
+            target: !input target_light
+
+      - conditions: "{{ act == 'off' }}"
+        sequence:
+          - action: light.turn_off
+            target: !input target_light
+
+      # --------------------------------------------------- stepped dimming
+      - conditions: "{{ act == 'brightness_step_up' }}"
+        sequence:
+          - action: light.turn_on
+            target: !input target_light
+            data:
+              brightness_step_pct: "{{ step_pct | int(8) }}"
+
+      - conditions: "{{ act == 'brightness_step_down' }}"
+        sequence:
+          - action: light.turn_on
+            target: !input target_light
+            data:
+              brightness_step_pct: "{{ 0 - (step_pct | int(8)) }}"
+
+      # ------------------------------- continuous dimming (button held down)
+      - conditions: "{{ act == 'brightness_move_up' }}"
+        sequence:
+          - repeat:
+              count: 13
+              sequence:
+                - action: light.turn_on
+                  target: !input target_light
+                  data:
+                    brightness_step_pct: "{{ step_pct | int(8) }}"
+                - delay:
+                    milliseconds: 300
+
+      - conditions: "{{ act == 'brightness_move_down' }}"
+        sequence:
+          - repeat:
+              count: 13
+              sequence:
+                - action: light.turn_on
+                  target: !input target_light
+                  data:
+                    brightness_step_pct: "{{ 0 - (step_pct | int(8)) }}"
+                - delay:
+                    milliseconds: 300
+
+      # Stop has nothing to do: simply re-triggering the automation
+      # (mode: restart) kills the loop that is currently running.
+      - conditions: "{{ act == 'brightness_stop' }}"
+        sequence:
+          - stop: "Dimming interrupted"
+
+      # -------------------------------------- absolute brightness (slider)
+      - conditions: "{{ act == 'brightness_move_to_level' and payload.action_level is defined }}"
+        sequence:
+          - action: light.turn_on
+            target: !input target_light
+            data:
+              brightness: "{{ payload.action_level | int(0) }}"
+
+      # ------------------------------------------------- colour temperature
+      - conditions: "{{ act == 'color_temperature_move' and payload.action_color_temperature is defined }}"
+        sequence:
+          - variables:
+              mireds: "{{ payload.action_color_temperature | float(370) }}"
+              mireds_cal: >-
+                {{ (mireds | float + (mireds | float - 314.5) / 5)
+                   if ct_cal else (mireds | float) }}
+          - action: light.turn_on
+            target: !input target_light
+            data:
+              color_temp_kelvin: >-
+                {{ [[ (1000000 / [mireds_cal | float(370), 1] | max) | round(0) | int,
+                      1500 ] | max, 8000 ] | min }}
+
+      # -------------------------------------------------------- colour wheel
+      # Depending on the firmware / converter version, Z2M sends either
+      # move_to_hue_and_saturation (action_hue / action_saturation)
+      # or color_move (action_color = {x, y}). Both are handled.
+      - conditions: >-
+          {{ act in ['move_to_hue_and_saturation', 'color_move',
+                     'move_to_color', 'hue_move', 'color_wheel'] }}
+        sequence:
+          - choose:
+              - conditions: "{{ payload.action_color is defined and payload.action_color is mapping }}"
+                sequence:
+                  - action: light.turn_on
+                    target: !input target_light
+                    data:
+                      xy_color:
+                        - "{{ payload.action_color.x | float(0.3) }}"
+                        - "{{ payload.action_color.y | float(0.3) }}"
+              - conditions: "{{ payload.action_hue is defined }}"
+                sequence:
+                  - action: light.turn_on
+                    target: !input target_light
+                    data:
+                      hs_color:
+                        - "{{ ((payload.action_hue | float(0)) / 254 * 360) | round(1) }}"
+                        - "{{ ((payload.action_saturation | float(254)) / 254 * 100) | round(1) }}"
+
+      # ---------------------------------------------------- scenes 1 to 6
+      - conditions: >-
+          {{ scene_no | int(0) > 0
+             and scene_target is not none
+             and scene_target | string not in ['', 'None'] }}
+        sequence:
+          - action: homeassistant.turn_on
+            target:
+              entity_id: "{{ scene_target }}"
